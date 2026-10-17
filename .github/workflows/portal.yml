@@ -1,0 +1,134 @@
+name: portal
+
+# Build and test the portal, then on main: publish it on GitHub Pages and on the Azure Storage
+# static website (OIDC as id-intplat-customer-portal). The same build serves both: relative paths,
+# hash routes. No secrets: the gateway URL and the Google client id are public settings (.env).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portal-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Bicep (any warning fails the build)
+        run: |
+          az bicep install --only-show-errors
+          diagnostics=$("$HOME/.azure/bin/bicep" build infra/main.bicep --stdout 2>&1 >/dev/null || true)
+          if echo "$diagnostics" | grep -qE ': (Warning|Error) '; then echo "$diagnostics"; exit 1; fi
+          echo "✅ infra/main.bicep"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal
+          path: dist
+          retention-days: 7
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  pages:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Smoke test
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          for attempt in $(seq 1 12); do
+            if curl -fsSL "$PAGE_URL" | grep -q "ACME Customer Portal"; then echo "✅ $PAGE_URL"; exit 0; fi
+            echo "attempt $attempt: not served yet"; sleep 10
+          done
+          exit 1
+
+  deploy:
+    name: Deploy to the storage static website
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: azure
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RESOURCE_GROUP: rg-intplat-customer-portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: portal
+          path: dist
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Acquire Event Grid token (for the deployment event)
+        run: |
+          token=$(az account get-access-token --resource https://eventgrid.azure.net --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          echo "EVENTGRID_TOKEN=$token" >> "$GITHUB_ENV"
+      - name: Infrastructure (what-if, then deploy)
+        run: |
+          az deployment group what-if -g "$RESOURCE_GROUP" -n customer-portal -f infra/main.bicep
+          read -r account url < <(az deployment group create -g "$RESOURCE_GROUP" -n customer-portal \
+            -f infra/main.bicep --query "[properties.outputs.accountName.value, properties.outputs.url.value]" -o tsv | paste -sd' ')
+          echo "ACCOUNT=$account" >> "$GITHUB_ENV"
+          echo "PORTAL_URL=${url%/}" >> "$GITHUB_ENV"
+          echo "::notice::Portal on Azure: ${url%/} (must be in integration-platform/routing/staff.yaml and in the Google client's origins)"
+      - name: Fetch the storage key (never stored)
+        run: |
+          key=$(az storage account keys list -g "$RESOURCE_GROUP" -n "$ACCOUNT" --query "[0].value" -o tsv)
+          echo "::add-mask::$key"
+          echo "AZURE_STORAGE_KEY=$key" >> "$GITHUB_ENV"
+      - name: Enable the static website and upload the portal
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ env.ACCOUNT }}
+        run: |
+          az storage blob service-properties update --static-website \
+            --index-document index.html --404-document index.html --only-show-errors -o none
+          az storage blob sync --container '$web' --source dist --delete-destination true --only-show-errors -o none
+      - name: Smoke test
+        run: |
+          for attempt in $(seq 1 12); do
+            if curl -fsS "$PORTAL_URL/" | grep -q "ACME Customer Portal"; then echo "✅ $PORTAL_URL"; exit 0; fi
+            echo "attempt $attempt: $(curl -s -o /dev/null -w '%{http_code}' "$PORTAL_URL/")"; sleep 10
+          done
+          exit 1
+      - name: Deployment event
+        if: always()
+        uses: azure-intelligence-domain/integration-platform/.github/actions/deployment-event@v1.2.0
+        with:
+          token: ${{ env.EVENTGRID_TOKEN }}
+          component: customer-portal
+          version: ${{ github.sha }}
+          status: ${{ job.status }}
